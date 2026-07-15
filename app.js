@@ -34,14 +34,74 @@ app.use(rateLimit({
   legacyHeaders: false
 }));
 
-function verifySecret(req, res, next) {
-  if (!config.appSecret) {
-    return next();
+function logInfo(event, data = {}) {
+  console.log(JSON.stringify({
+    level: "info",
+    event,
+    timestamp: new Date().toISOString(),
+    ...data
+  }));
+}
+
+function logWarning(event, data = {}) {
+  console.warn(JSON.stringify({
+    level: "warning",
+    event,
+    timestamp: new Date().toISOString(),
+    ...data
+  }));
+}
+
+function logError(event, error, data = {}) {
+  console.error(JSON.stringify({
+    level: "error",
+    event,
+    timestamp: new Date().toISOString(),
+    error: error instanceof Error ? error.message : String(error || ""),
+    stack: error instanceof Error ? error.stack : null,
+    ...data
+  }));
+}
+
+function sanitizeUrlForLogs(value) {
+  try {
+    const parsed = new URL(String(value || ""));
+    parsed.hash = "";
+
+    if (parsed.pathname.includes("/gz/account-verification")) {
+      return {
+        url: `${parsed.origin}${parsed.pathname}`,
+        verification_target: parsed.searchParams.get("go") || null,
+        trace_id: parsed.searchParams.get("tid") || null
+      };
+    }
+
+    return {
+      url: parsed.toString(),
+      verification_target: null,
+      trace_id: null
+    };
+  } catch {
+    return {
+      url: String(value || ""),
+      verification_target: null,
+      trace_id: null
+    };
   }
+}
+
+function verifySecret(req, res, next) {
+  if (!config.appSecret) return next();
 
   const received = String(req.header("x-app-secret") || "");
 
   if (received !== config.appSecret) {
+    logWarning("unauthorized_request", {
+      path: req.path,
+      method: req.method,
+      remote_ip: req.ip || null
+    });
+
     return res.status(401).json({
       ok: false,
       error: "unauthorized"
@@ -52,14 +112,8 @@ function verifySecret(req, res, next) {
 }
 
 function normalizeMla(value) {
-  const text = String(value || "").trim().toUpperCase();
-  const match = text.match(/MLA[-\s]?(\d{6,})/i);
-
-  if (!match) {
-    return "";
-  }
-
-  return `MLA${match[1]}`;
+  const match = String(value || "").trim().toUpperCase().match(/MLA[-\s]?(\d{6,})/i);
+  return match ? `MLA${match[1]}` : "";
 }
 
 function extractMlaFromUrl(url) {
@@ -77,10 +131,7 @@ function validateTargetUrl(value) {
     const hostname = parsed.hostname.toLowerCase();
 
     if (!["http:", "https:"].includes(parsed.protocol)) {
-      return {
-        ok: false,
-        error: "invalid_protocol"
-      };
+      return { ok: false, error: "invalid_protocol" };
     }
 
     const allowed =
@@ -88,10 +139,7 @@ function validateTargetUrl(value) {
       hostname.endsWith(".mercadolibre.com.ar");
 
     if (!allowed) {
-      return {
-        ok: false,
-        error: "host_not_allowed"
-      };
+      return { ok: false, error: "host_not_allowed" };
     }
 
     return {
@@ -100,19 +148,14 @@ function validateTargetUrl(value) {
       hostname
     };
   } catch {
-    return {
-      ok: false,
-      error: "invalid_url"
-    };
+    return { ok: false, error: "invalid_url" };
   }
 }
 
 function cacheGet(key) {
   const entry = cache.get(key);
 
-  if (!entry) {
-    return null;
-  }
+  if (!entry) return null;
 
   if (Date.now() >= entry.expiresAt) {
     cache.delete(key);
@@ -148,9 +191,7 @@ function parseSoldNumber(displayText) {
 
   const numericMatch = normalized.match(/[\d.,]+/);
 
-  if (!numericMatch) {
-    return null;
-  }
+  if (!numericMatch) return null;
 
   let numericText = numericMatch[0];
   const usesMillion = /\bmill[oó]n(?:es)?\b/i.test(normalized);
@@ -158,12 +199,9 @@ function parseSoldNumber(displayText) {
 
   if (usesMillion || usesThousand) {
     numericText = numericText.replace(",", ".");
-
     const parsed = Number(numericText);
 
-    if (!Number.isFinite(parsed)) {
-      return null;
-    }
+    if (!Number.isFinite(parsed)) return null;
 
     return Math.round(parsed * (usesMillion ? 1000000 : 1000));
   }
@@ -172,12 +210,7 @@ function parseSoldNumber(displayText) {
   numericText = numericText.replace(",", ".");
 
   const parsed = Number(numericText);
-
-  if (!Number.isFinite(parsed)) {
-    return null;
-  }
-
-  return Math.round(parsed);
+  return Number.isFinite(parsed) ? Math.round(parsed) : null;
 }
 
 function classifySoldDisplay(displayText) {
@@ -200,7 +233,6 @@ function classifySoldDisplay(displayText) {
 
 function findSoldCandidates(text) {
   const normalized = cleanText(text);
-
   const patterns = [
     /(?:más de|mas de)\s+[\d.,]+\s*(?:mil|mill[oó]n(?:es)?)?\s+vendidos?/gi,
     /\+[\d.,]+\s*(?:mil|mill[oó]n(?:es)?)?\s+vendidos?/gi,
@@ -227,7 +259,6 @@ function findSoldCandidates(text) {
 
 function detectBlockedPage(text, title, url) {
   const combined = `${title}\n${text}\n${url}`.toLowerCase();
-
   const indicators = [
     "account-verification",
     "para continuar, ingresa a",
@@ -268,27 +299,18 @@ async function waitForBrowserSlot() {
     return;
   }
 
-  await new Promise(resolve => {
-    browserQueue.push(resolve);
-  });
-
+  await new Promise(resolve => browserQueue.push(resolve));
   activeBrowserJobs += 1;
 }
 
 function releaseBrowserSlot() {
   activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
-
   const next = browserQueue.shift();
-
-  if (next) {
-    next();
-  }
+  if (next) next();
 }
 
 async function getBrowser() {
-  if (browserPromise) {
-    return browserPromise;
-  }
+  if (browserPromise) return browserPromise;
 
   const launchOptions = {
     headless: config.browserHeadless,
@@ -311,18 +333,32 @@ async function getBrowser() {
     launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
   }
 
+  logInfo("browser_launch_started", {
+    headless: config.browserHeadless,
+    executable_path: launchOptions.executablePath || "puppeteer_default"
+  });
+
   browserPromise = puppeteer.launch(launchOptions);
 
   try {
     const browser = await browserPromise;
 
+    logInfo("browser_launch_completed", {
+      connected: Boolean(browser.connected),
+      version: await browser.version().catch(() => "unknown")
+    });
+
     browser.on("disconnected", () => {
+      logWarning("browser_disconnected");
       browserPromise = null;
     });
 
     return browser;
   } catch (error) {
     browserPromise = null;
+    logError("browser_launch_failed", error, {
+      executable_path: launchOptions.executablePath || "puppeteer_default"
+    });
     throw error;
   }
 }
@@ -373,8 +409,22 @@ async function inspectPage(page) {
 
 async function scrapeUrl(targetUrl, options = {}) {
   const startedAt = Date.now();
+  const requestId = `scrape_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+  logInfo("scrape_started", {
+    request_id: requestId,
+    requested_url: sanitizeUrlForLogs(targetUrl).url,
+    authenticated: false,
+    screenshot_requested: Boolean(options.screenshot)
+  });
 
   await waitForBrowserSlot();
+
+  logInfo("browser_slot_acquired", {
+    request_id: requestId,
+    active_browser_jobs: activeBrowserJobs,
+    queued_browser_jobs: browserQueue.length
+  });
 
   let page = null;
 
@@ -402,33 +452,75 @@ async function scrapeUrl(targetUrl, options = {}) {
 
     const networkErrors = [];
     const relevantResponses = [];
+    const redirects = [];
 
     page.on("requestfailed", request => {
-      networkErrors.push({
-        url: request.url().slice(0, 500),
-        error: request.failure()?.errorText || "request_failed"
+      const failure = {
+        url: sanitizeUrlForLogs(request.url()).url.slice(0, 500),
+        error: request.failure()?.errorText || "request_failed",
+        resource_type: request.resourceType()
+      };
+
+      networkErrors.push(failure);
+      logWarning("network_request_failed", {
+        request_id: requestId,
+        ...failure
       });
     });
 
     page.on("response", response => {
       const responseUrl = response.url();
       const resourceType = response.request().resourceType();
+      const status = response.status();
 
       if (
         resourceType === "document" ||
-        /item|product|catalog|sold|review/i.test(responseUrl)
+        /item|product|catalog|sold|review|account-verification/i.test(responseUrl)
       ) {
-        relevantResponses.push({
-          status: response.status(),
-          url: responseUrl.slice(0, 500),
+        const responseEntry = {
+          status,
+          url: sanitizeUrlForLogs(responseUrl).url.slice(0, 500),
           resource_type: resourceType
+        };
+
+        relevantResponses.push(responseEntry);
+        logInfo("browser_response", {
+          request_id: requestId,
+          ...responseEntry
         });
       }
+
+      if (status >= 300 && status < 400) {
+        const location = response.headers().location || null;
+        const redirectEntry = {
+          status,
+          from: sanitizeUrlForLogs(responseUrl).url,
+          to: location
+        };
+
+        redirects.push(redirectEntry);
+        logWarning("browser_redirect_detected", {
+          request_id: requestId,
+          ...redirectEntry
+        });
+      }
+    });
+
+    logInfo("navigation_started", {
+      request_id: requestId,
+      target_url: sanitizeUrlForLogs(targetUrl).url,
+      timeout_ms: config.browserTimeoutMs
     });
 
     const response = await page.goto(targetUrl, {
       waitUntil: "domcontentloaded",
       timeout: config.browserTimeoutMs
+    });
+
+    logInfo("navigation_document_loaded", {
+      request_id: requestId,
+      http_status: response ? response.status() : null,
+      current_url: sanitizeUrlForLogs(page.url()).url
     });
 
     await Promise.race([
@@ -444,37 +536,84 @@ async function scrapeUrl(targetUrl, options = {}) {
     const pageData = await inspectPage(page);
     const title = await page.title();
     const finalUrl = page.url();
+    const finalUrlData = sanitizeUrlForLogs(finalUrl);
     const bodyText = cleanText(pageData.bodyText);
     const selectedText = cleanText(pageData.selectedTexts.join("\n"));
     const scriptText = cleanText(pageData.scripts.join("\n"));
 
-    const visibleCandidates = findSoldCandidates(
-      `${selectedText}\n${bodyText}`
-    );
-
+    const visibleCandidates = findSoldCandidates(`${selectedText}\n${bodyText}`);
     const scriptCandidates = findSoldCandidates(scriptText);
     const soldCandidates = [...visibleCandidates];
 
     for (const candidate of scriptCandidates) {
-      if (!soldCandidates.includes(candidate)) {
-        soldCandidates.push(candidate);
-      }
+      if (!soldCandidates.includes(candidate)) soldCandidates.push(candidate);
     }
 
     const soldDisplay = visibleCandidates[0] || scriptCandidates[0] || null;
-
     const soldData = soldDisplay
       ? classifySoldDisplay(soldDisplay)
-      : {
-          value: null,
-          approximate: null,
-          lowerBound: null
-        };
+      : { value: null, approximate: null, lowerBound: null };
 
     const blockedIndicators = detectBlockedPage(bodyText, title, finalUrl);
     const authenticationRequired = detectAuthenticationRequired(bodyText, finalUrl);
-    const screenshotEnabled = options.screenshot || config.saveScreenshots;
+    const blocked = blockedIndicators.length > 0;
+    const redirected = finalUrl !== targetUrl;
 
+    if (authenticationRequired) {
+      logError(
+        "mercadolibre_authentication_required",
+        new Error("Mercado Libre redirigió la navegación a verificación de cuenta"),
+        {
+          request_id: requestId,
+          requested_url: sanitizeUrlForLogs(targetUrl).url,
+          final_url: finalUrlData.url,
+          verification_target: finalUrlData.verification_target,
+          trace_id: finalUrlData.trace_id,
+          http_status: response ? response.status() : null,
+          redirected,
+          blocked_indicators: blockedIndicators,
+          page_title: title
+        }
+      );
+    } else if (blocked) {
+      logError(
+        "mercadolibre_navigation_blocked",
+        new Error("Mercado Libre bloqueó la navegación automatizada"),
+        {
+          request_id: requestId,
+          requested_url: sanitizeUrlForLogs(targetUrl).url,
+          final_url: finalUrlData.url,
+          http_status: response ? response.status() : null,
+          blocked_indicators: blockedIndicators,
+          page_title: title
+        }
+      );
+    } else if (!soldDisplay) {
+      logWarning("sold_quantity_not_found", {
+        request_id: requestId,
+        requested_url: sanitizeUrlForLogs(targetUrl).url,
+        final_url: finalUrlData.url,
+        http_status: response ? response.status() : null,
+        redirected,
+        page_title: title,
+        html_length: pageData.htmlLength,
+        body_text_sample: bodyText.slice(0, 500)
+      });
+    } else {
+      logInfo("sold_quantity_found", {
+        request_id: requestId,
+        requested_url: sanitizeUrlForLogs(targetUrl).url,
+        final_url: finalUrlData.url,
+        sold: soldData.value,
+        sold_display: soldDisplay,
+        sold_approximate: soldData.approximate,
+        sold_source: visibleCandidates.includes(soldDisplay)
+          ? "visible_page_text"
+          : "embedded_script"
+      });
+    }
+
+    const screenshotEnabled = options.screenshot || config.saveScreenshots;
     let screenshotBase64 = null;
 
     if (screenshotEnabled) {
@@ -484,19 +623,26 @@ async function scrapeUrl(targetUrl, options = {}) {
         fullPage: false,
         encoding: "base64"
       });
+
+      logInfo("diagnostic_screenshot_created", {
+        request_id: requestId,
+        encoding: "base64",
+        size_characters: screenshotBase64.length
+      });
     }
 
     const result = {
       ok: true,
+      request_id: requestId,
       requested_url: targetUrl,
       final_url: finalUrl,
-      redirected: finalUrl !== targetUrl,
+      redirected,
       item_id: extractMlaFromUrl(finalUrl) || extractMlaFromUrl(targetUrl) || null,
       authenticated: false,
       authentication_required: authenticationRequired,
       http_status: response ? response.status() : null,
       page_title: title,
-      blocked: blockedIndicators.length > 0,
+      blocked,
       blocked_indicators: blockedIndicators,
       sold_found: Boolean(soldDisplay),
       sold: soldData.value,
@@ -514,6 +660,7 @@ async function scrapeUrl(targetUrl, options = {}) {
         html_length: pageData.htmlLength,
         body_text_sample: bodyText.slice(0, config.maxResponseTextLength),
         network_errors: networkErrors.slice(0, 20),
+        redirects: redirects.slice(0, 20),
         relevant_responses: relevantResponses.slice(-30),
         duration_ms: Date.now() - startedAt
       }
@@ -523,23 +670,50 @@ async function scrapeUrl(targetUrl, options = {}) {
       result.diagnostics.screenshot_base64 = screenshotBase64;
     }
 
+    logInfo("scrape_completed", {
+      request_id: requestId,
+      duration_ms: Date.now() - startedAt,
+      requested_url: sanitizeUrlForLogs(targetUrl).url,
+      final_url: finalUrlData.url,
+      redirected,
+      authentication_required: authenticationRequired,
+      blocked,
+      sold_found: Boolean(soldDisplay),
+      sold_display: soldDisplay
+    });
+
     return result;
+  } catch (error) {
+    logError("scrape_failed", error, {
+      request_id: requestId,
+      requested_url: sanitizeUrlForLogs(targetUrl).url,
+      current_url: page ? sanitizeUrlForLogs(page.url()).url : null,
+      duration_ms: Date.now() - startedAt
+    });
+
+    throw error;
   } finally {
     if (page) {
-      await page.close().catch(() => null);
+      await page.close().catch(error => {
+        logWarning("browser_page_close_failed", {
+          request_id: requestId,
+          error: error.message
+        });
+      });
     }
 
     releaseBrowserSlot();
+
+    logInfo("browser_slot_released", {
+      request_id: requestId,
+      active_browser_jobs: activeBrowserJobs,
+      queued_browser_jobs: browserQueue.length
+    });
   }
 }
 
 async function handleScrape(req, res) {
-  const suppliedUrl = String(
-    req.body?.url ||
-    req.query?.url ||
-    ""
-  ).trim();
-
+  const suppliedUrl = String(req.body?.url || req.query?.url || "").trim();
   const suppliedMla = normalizeMla(
     req.params?.mla ||
     req.body?.mla ||
@@ -547,12 +721,7 @@ async function handleScrape(req, res) {
     ""
   );
 
-  const force = String(
-    req.body?.force ||
-    req.query?.force ||
-    "false"
-  ) === "true";
-
+  const force = String(req.body?.force || req.query?.force || "false") === "true";
   const screenshot = String(
     req.body?.screenshot ||
     req.query?.screenshot ||
@@ -565,6 +734,11 @@ async function handleScrape(req, res) {
     const validation = validateTargetUrl(suppliedUrl);
 
     if (!validation.ok) {
+      logWarning("invalid_target_url", {
+        error: validation.error,
+        supplied_url: suppliedUrl
+      });
+
       return res.status(400).json({
         ok: false,
         error: validation.error,
@@ -589,6 +763,10 @@ async function handleScrape(req, res) {
     const cached = cacheGet(cacheKey);
 
     if (cached) {
+      logInfo("cache_hit", {
+        requested_url: sanitizeUrlForLogs(targetUrl).url
+      });
+
       return res.json({
         ...cached,
         cached: true
@@ -597,19 +775,21 @@ async function handleScrape(req, res) {
   }
 
   try {
-    const result = await scrapeUrl(targetUrl, {
-      screenshot
-    });
+    const result = await scrapeUrl(targetUrl, { screenshot });
 
-    if (!screenshot) {
-      cacheSet(cacheKey, result);
-    }
+    if (!screenshot) cacheSet(cacheKey, result);
 
     return res.json({
       ...result,
       cached: false
     });
   } catch (error) {
+    logError("scrape_request_failed", error, {
+      requested_url: sanitizeUrlForLogs(targetUrl).url,
+      authenticated: false,
+      chromium_path: process.env.PUPPETEER_EXECUTABLE_PATH || "puppeteer_default"
+    });
+
     return res.status(500).json({
       ok: false,
       error: "scrape_failed",
@@ -662,6 +842,11 @@ app.get("/scrape", verifySecret, handleScrape);
 app.get("/scrape/:mla", verifySecret, handleScrape);
 
 app.use((error, req, res, next) => {
+  logError("unhandled_application_error", error, {
+    method: req.method,
+    path: req.path
+  });
+
   return res.status(500).json({
     ok: false,
     error: "internal_error",
@@ -670,11 +855,19 @@ app.use((error, req, res, next) => {
 });
 
 const server = app.listen(config.port, "0.0.0.0", () => {
-  console.log(`Servidor iniciado en el puerto ${config.port}`);
+  logInfo("service_started", {
+    port: config.port,
+    node_version: process.version,
+    browser_headless: config.browserHeadless,
+    browser_timeout_ms: config.browserTimeoutMs,
+    browser_concurrency: config.browserConcurrency,
+    screenshots_enabled: config.saveScreenshots,
+    app_secret_configured: Boolean(config.appSecret)
+  });
 });
 
 async function shutdown(signal) {
-  console.log(`Cerrando servicio por ${signal}`);
+  logWarning("service_shutdown_started", { signal });
 
   server.close(async () => {
     try {
@@ -682,9 +875,11 @@ async function shutdown(signal) {
         const browser = await browserPromise;
         await browser.close();
       }
-    } catch {
+    } catch (error) {
+      logError("browser_shutdown_failed", error);
     }
 
+    logInfo("service_shutdown_completed", { signal });
     process.exit(0);
   });
 
