@@ -15,14 +15,14 @@ const config = {
   browserConcurrency: Math.max(1, Number(process.env.BROWSER_CONCURRENCY || 1)),
   cacheTtlMs: Number(process.env.CACHE_TTL_MS || 1000 * 60 * 30),
   saveScreenshots: String(process.env.SAVE_SCREENSHOTS || "false") === "true",
-  maxResponseTextLength: Number(process.env.MAX_RESPONSE_TEXT_LENGTH || 3000)
+  maxResponseTextLength: Number(process.env.MAX_RESPONSE_TEXT_LENGTH || 5000)
 };
 
 const cache = new Map();
+const browserQueue = [];
 
 let browserPromise = null;
-let activeBrowsers = 0;
-const browserQueue = [];
+let activeBrowserJobs = 0;
 
 app.set("trust proxy", 1);
 app.use(helmet());
@@ -33,22 +33,6 @@ app.use(rateLimit({
   standardHeaders: true,
   legacyHeaders: false
 }));
-
-function normalizeMla(value) {
-  const text = String(value || "").trim().toUpperCase();
-  const match = text.match(/MLA[-\s]?(\d{6,})/i);
-
-  if (!match) {
-    return "";
-  }
-
-  return `MLA${match[1]}`;
-}
-
-function buildItemUrl(mla) {
-  const numericId = mla.replace(/^MLA/, "");
-  return `https://articulo.mercadolibre.com.ar/MLA-${numericId}-_JM`;
-}
 
 function verifySecret(req, res, next) {
   if (!config.appSecret) {
@@ -65,6 +49,62 @@ function verifySecret(req, res, next) {
   }
 
   return next();
+}
+
+function normalizeMla(value) {
+  const text = String(value || "").trim().toUpperCase();
+  const match = text.match(/MLA[-\s]?(\d{6,})/i);
+
+  if (!match) {
+    return "";
+  }
+
+  return `MLA${match[1]}`;
+}
+
+function extractMlaFromUrl(url) {
+  return normalizeMla(url);
+}
+
+function buildItemUrl(mla) {
+  const numericId = String(mla || "").replace(/^MLA/i, "");
+  return `https://articulo.mercadolibre.com.ar/MLA-${numericId}-_JM`;
+}
+
+function validateTargetUrl(value) {
+  try {
+    const parsed = new URL(String(value || "").trim());
+    const hostname = parsed.hostname.toLowerCase();
+
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return {
+        ok: false,
+        error: "invalid_protocol"
+      };
+    }
+
+    const allowed =
+      hostname === "mercadolibre.com.ar" ||
+      hostname.endsWith(".mercadolibre.com.ar");
+
+    if (!allowed) {
+      return {
+        ok: false,
+        error: "host_not_allowed"
+      };
+    }
+
+    return {
+      ok: true,
+      url: parsed.toString(),
+      hostname
+    };
+  } catch {
+    return {
+      ok: false,
+      error: "invalid_url"
+    };
+  }
 }
 
 function cacheGet(key) {
@@ -89,18 +129,8 @@ function cacheSet(key, value) {
   });
 }
 
-function decodeHtmlEntities(text) {
-  return String(text || "")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, "\"")
-    .replace(/&#39;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">");
-}
-
 function cleanText(value) {
-  return decodeHtmlEntities(value)
+  return String(value || "")
     .replace(/\u00a0/g, " ")
     .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
@@ -128,6 +158,7 @@ function parseSoldNumber(displayText) {
 
   if (usesMillion || usesThousand) {
     numericText = numericText.replace(",", ".");
+
     const parsed = Number(numericText);
 
     if (!Number.isFinite(parsed)) {
@@ -153,9 +184,17 @@ function classifySoldDisplay(displayText) {
   const text = cleanText(displayText).toLowerCase();
 
   return {
-    approximate: text.includes("+") || text.includes("más de") || text.includes("mas de") || /\bmil\b/.test(text) || /\bmill[oó]n/.test(text),
-    lowerBound: text.includes("+") || text.includes("más de") || text.includes("mas de"),
-    value: parseSoldNumber(displayText)
+    value: parseSoldNumber(displayText),
+    approximate:
+      text.includes("+") ||
+      text.includes("más de") ||
+      text.includes("mas de") ||
+      /\bmil\b/.test(text) ||
+      /\bmill[oó]n/.test(text),
+    lowerBound:
+      text.includes("+") ||
+      text.includes("más de") ||
+      text.includes("mas de")
   };
 }
 
@@ -175,10 +214,10 @@ function findSoldCandidates(text) {
     const matches = normalized.match(pattern) || [];
 
     for (const match of matches) {
-      const cleaned = cleanText(match);
+      const candidate = cleanText(match);
 
-      if (!candidates.includes(cleaned)) {
-        candidates.push(cleaned);
+      if (candidate && !candidates.includes(candidate)) {
+        candidates.push(candidate);
       }
     }
   }
@@ -190,28 +229,42 @@ function detectBlockedPage(text, title, url) {
   const combined = `${title}\n${text}\n${url}`.toLowerCase();
 
   const indicators = [
+    "account-verification",
+    "para continuar, ingresa a",
+    "para continuar, ingresá a",
+    "ya tengo cuenta",
+    "soy nuevo",
     "captcha",
-    "no pudimos procesar tu solicitud",
-    "por favor verifica que eres humano",
-    "verificá que sos humano",
     "verifica que eres humano",
+    "verificá que sos humano",
+    "validación de seguridad",
+    "validacion de seguridad",
+    "security check",
     "access denied",
     "acceso denegado",
     "demasiadas solicitudes",
     "too many requests",
-    "security check",
-    "validación de seguridad",
-    "validacion de seguridad",
-    "algo salió mal",
-    "algo salio mal"
+    "no pudimos procesar tu solicitud"
   ];
 
   return indicators.filter(indicator => combined.includes(indicator));
 }
 
+function detectAuthenticationRequired(text, url) {
+  const combined = `${text}\n${url}`.toLowerCase();
+
+  return [
+    "account-verification",
+    "para continuar, ingresa a",
+    "para continuar, ingresá a",
+    "ya tengo cuenta",
+    "soy nuevo"
+  ].some(indicator => combined.includes(indicator));
+}
+
 async function waitForBrowserSlot() {
-  if (activeBrowsers < config.browserConcurrency) {
-    activeBrowsers += 1;
+  if (activeBrowserJobs < config.browserConcurrency) {
+    activeBrowserJobs += 1;
     return;
   }
 
@@ -219,11 +272,12 @@ async function waitForBrowserSlot() {
     browserQueue.push(resolve);
   });
 
-  activeBrowsers += 1;
+  activeBrowserJobs += 1;
 }
 
 function releaseBrowserSlot() {
-  activeBrowsers = Math.max(0, activeBrowsers - 1);
+  activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
+
   const next = browserQueue.shift();
 
   if (next) {
@@ -280,6 +334,8 @@ async function inspectPage(page) {
       ".ui-pdp-header__subtitle",
       ".ui-pdp-header",
       ".ui-pdp-container",
+      "[class*='subtitle']",
+      "[class*='sold']",
       "main",
       "body"
     ];
@@ -287,7 +343,7 @@ async function inspectPage(page) {
     const selectedTexts = [];
 
     for (const selector of selectors) {
-      const elements = Array.from(document.querySelectorAll(selector)).slice(0, 20);
+      const elements = Array.from(document.querySelectorAll(selector)).slice(0, 30);
 
       for (const element of elements) {
         const text = String(element.innerText || element.textContent || "").trim();
@@ -301,29 +357,21 @@ async function inspectPage(page) {
     const scripts = Array.from(document.scripts)
       .map(script => script.textContent || "")
       .filter(text => /sold|vendidos|sold_quantity/i.test(text))
-      .slice(0, 10)
-      .map(text => text.slice(0, 10000));
-
-    const meta = Array.from(document.querySelectorAll("meta"))
-      .map(element => ({
-        name: element.getAttribute("name"),
-        property: element.getAttribute("property"),
-        content: element.getAttribute("content")
-      }))
-      .filter(entry => entry.content);
+      .slice(0, 20)
+      .map(text => text.slice(0, 20000));
 
     return {
       bodyText: document.body ? document.body.innerText || "" : "",
       selectedTexts,
       scripts,
-      meta,
-      htmlLength: document.documentElement ? document.documentElement.outerHTML.length : 0
+      htmlLength: document.documentElement
+        ? document.documentElement.outerHTML.length
+        : 0
     };
   });
 }
 
-async function scrapeSoldQuantity(mla, options = {}) {
-  const itemUrl = buildItemUrl(mla);
+async function scrapeUrl(targetUrl, options = {}) {
   const startedAt = Date.now();
 
   await waitForBrowserSlot();
@@ -332,7 +380,6 @@ async function scrapeSoldQuantity(mla, options = {}) {
 
   try {
     const browser = await getBrowser();
-
     page = await browser.newPage();
 
     await page.setViewport({
@@ -354,7 +401,7 @@ async function scrapeSoldQuantity(mla, options = {}) {
     page.setDefaultTimeout(config.browserTimeoutMs);
 
     const networkErrors = [];
-    const responses = [];
+    const relevantResponses = [];
 
     page.on("requestfailed", request => {
       networkErrors.push({
@@ -364,28 +411,31 @@ async function scrapeSoldQuantity(mla, options = {}) {
     });
 
     page.on("response", response => {
-      const url = response.url();
+      const responseUrl = response.url();
+      const resourceType = response.request().resourceType();
 
       if (
-        response.request().resourceType() === "document" ||
-        /item|product|catalog|sold/i.test(url)
+        resourceType === "document" ||
+        /item|product|catalog|sold|review/i.test(responseUrl)
       ) {
-        responses.push({
+        relevantResponses.push({
           status: response.status(),
-          url: url.slice(0, 500),
-          resourceType: response.request().resourceType()
+          url: responseUrl.slice(0, 500),
+          resource_type: resourceType
         });
       }
     });
 
-    const response = await page.goto(itemUrl, {
+    const response = await page.goto(targetUrl, {
       waitUntil: "domcontentloaded",
       timeout: config.browserTimeoutMs
     });
 
     await Promise.race([
       page.waitForFunction(
-        () => /vendidos?|captcha|verific[aá]|acceso denegado/i.test(document.body?.innerText || ""),
+        () => /vendidos?|account-verification|captcha|ingresa a|ingresá a/i.test(
+          document.body?.innerText || location.href
+        ),
         { timeout: Math.min(config.browserTimeoutMs, 15000) }
       ).catch(() => null),
       new Promise(resolve => setTimeout(resolve, 5000))
@@ -403,69 +453,68 @@ async function scrapeSoldQuantity(mla, options = {}) {
     );
 
     const scriptCandidates = findSoldCandidates(scriptText);
-
-    const candidates = [...visibleCandidates];
+    const soldCandidates = [...visibleCandidates];
 
     for (const candidate of scriptCandidates) {
-      if (!candidates.includes(candidate)) {
-        candidates.push(candidate);
+      if (!soldCandidates.includes(candidate)) {
+        soldCandidates.push(candidate);
       }
     }
 
     const soldDisplay = visibleCandidates[0] || scriptCandidates[0] || null;
+
     const soldData = soldDisplay
       ? classifySoldDisplay(soldDisplay)
       : {
+          value: null,
           approximate: null,
-          lowerBound: null,
-          value: null
+          lowerBound: null
         };
 
     const blockedIndicators = detectBlockedPage(bodyText, title, finalUrl);
-    const blocked = blockedIndicators.length > 0;
+    const authenticationRequired = detectAuthenticationRequired(bodyText, finalUrl);
     const screenshotEnabled = options.screenshot || config.saveScreenshots;
 
     let screenshotBase64 = null;
 
     if (screenshotEnabled) {
-      const screenshot = await page.screenshot({
+      screenshotBase64 = await page.screenshot({
         type: "jpeg",
         quality: 65,
         fullPage: false,
         encoding: "base64"
       });
-
-      screenshotBase64 = screenshot;
     }
 
     const result = {
       ok: true,
-      item_id: mla,
-      requested_url: itemUrl,
+      requested_url: targetUrl,
       final_url: finalUrl,
-      redirected: finalUrl !== itemUrl,
+      redirected: finalUrl !== targetUrl,
+      item_id: extractMlaFromUrl(finalUrl) || extractMlaFromUrl(targetUrl) || null,
       authenticated: false,
+      authentication_required: authenticationRequired,
       http_status: response ? response.status() : null,
       page_title: title,
-      blocked,
+      blocked: blockedIndicators.length > 0,
       blocked_indicators: blockedIndicators,
       sold_found: Boolean(soldDisplay),
       sold: soldData.value,
       sold_display: soldDisplay,
       sold_approximate: soldData.approximate,
       sold_lower_bound: soldData.lowerBound,
-      sold_scope: "item",
+      sold_scope: extractMlaFromUrl(targetUrl) ? "unknown_meli_entity" : "unknown",
       sold_source: soldDisplay
         ? visibleCandidates.includes(soldDisplay)
           ? "visible_page_text"
           : "embedded_script"
         : "not_found",
-      sold_candidates: candidates.slice(0, 20),
+      sold_candidates: soldCandidates.slice(0, 20),
       diagnostics: {
         html_length: pageData.htmlLength,
         body_text_sample: bodyText.slice(0, config.maxResponseTextLength),
         network_errors: networkErrors.slice(0, 20),
-        relevant_responses: responses.slice(-30),
+        relevant_responses: relevantResponses.slice(-30),
         duration_ms: Date.now() - startedAt
       }
     };
@@ -485,21 +534,56 @@ async function scrapeSoldQuantity(mla, options = {}) {
 }
 
 async function handleScrape(req, res) {
-  const mla = normalizeMla(req.params.mla || req.body?.mla);
-  const force = String(req.query.force || req.body?.force || "false") === "true";
-  const screenshot = String(
-    req.query.screenshot || req.body?.screenshot || "false"
+  const suppliedUrl = String(
+    req.body?.url ||
+    req.query?.url ||
+    ""
+  ).trim();
+
+  const suppliedMla = normalizeMla(
+    req.params?.mla ||
+    req.body?.mla ||
+    req.query?.mla ||
+    ""
+  );
+
+  const force = String(
+    req.body?.force ||
+    req.query?.force ||
+    "false"
   ) === "true";
 
-  if (!mla) {
+  const screenshot = String(
+    req.body?.screenshot ||
+    req.query?.screenshot ||
+    "false"
+  ) === "true";
+
+  let targetUrl = "";
+
+  if (suppliedUrl) {
+    const validation = validateTargetUrl(suppliedUrl);
+
+    if (!validation.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: validation.error,
+        message: "La URL debe pertenecer a mercadolibre.com.ar"
+      });
+    }
+
+    targetUrl = validation.url;
+  } else if (suppliedMla) {
+    targetUrl = buildItemUrl(suppliedMla);
+  } else {
     return res.status(400).json({
       ok: false,
-      error: "invalid_mla",
-      message: "Enviá un MLA válido, por ejemplo MLA1621055253"
+      error: "missing_target",
+      message: "Enviá una URL de Mercado Libre en url o un MLA en mla"
     });
   }
 
-  const cacheKey = `anonymous:${mla}`;
+  const cacheKey = `anonymous:${targetUrl}`;
 
   if (!force) {
     const cached = cacheGet(cacheKey);
@@ -513,7 +597,7 @@ async function handleScrape(req, res) {
   }
 
   try {
-    const result = await scrapeSoldQuantity(mla, {
+    const result = await scrapeUrl(targetUrl, {
       screenshot
     });
 
@@ -530,7 +614,7 @@ async function handleScrape(req, res) {
       ok: false,
       error: "scrape_failed",
       message: error.message,
-      item_id: mla,
+      requested_url: targetUrl,
       authenticated: false,
       chromium_path: process.env.PUPPETEER_EXECUTABLE_PATH || null
     });
@@ -540,12 +624,13 @@ async function handleScrape(req, res) {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "mercadolibre-sold-scraper-test",
+    service: "mercadolibre-browser-scraper-test",
     authenticated: false,
     endpoints: {
       health: "GET /health",
-      scrape_get: "GET /scrape/MLA1621055253",
-      scrape_post: "POST /scrape"
+      scrape_post: "POST /scrape",
+      scrape_url: "GET /scrape?url=URL_CODIFICADA",
+      scrape_mla: "GET /scrape/MLA63233625"
     }
   });
 });
@@ -556,27 +641,28 @@ app.get("/health", async (req, res) => {
 
   try {
     const browser = await getBrowser();
-    browserConnected = browser.connected;
+    browserConnected = Boolean(browser.connected);
   } catch (error) {
     browserError = error.message;
   }
 
-  res.status(browserConnected ? 200 : 503).json({
+  return res.status(browserConnected ? 200 : 503).json({
     ok: browserConnected,
     browser_connected: browserConnected,
     browser_error: browserError,
-    active_browser_jobs: activeBrowsers,
+    active_browser_jobs: activeBrowserJobs,
     queued_browser_jobs: browserQueue.length,
     cache_entries: cache.size,
     authenticated: false
   });
 });
 
-app.get("/scrape/:mla", verifySecret, handleScrape);
 app.post("/scrape", verifySecret, handleScrape);
+app.get("/scrape", verifySecret, handleScrape);
+app.get("/scrape/:mla", verifySecret, handleScrape);
 
 app.use((error, req, res, next) => {
-  res.status(500).json({
+  return res.status(500).json({
     ok: false,
     error: "internal_error",
     message: error.message
